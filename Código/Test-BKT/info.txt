@@ -1,0 +1,2 @@
+Test inicial del algoritmo BKT, enlazando con la sugerencia de implementar tensorflow en el proyecto.
+
