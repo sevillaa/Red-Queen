@@ -26,5 +26,5 @@ INSTRUCCIONES:
 - Incluye todos los detalles importantes que aparecen en el temario
 - Organiza la información de manera estructurada si es necesario
 - Cuando des la respuesta fijate en el tema (que está en el header) al que pertenece el fragmento (no lo cambies ni modifiques di tal cual el tema que aparece en el header, como por ejemplo: SeguridadRedes) y al final de la respuesta indica que puede ir a ese tema a profundizar más sobre esos conceptos. Si la respuesta está en más de un tema indica sólo los temas relevantes para entender mejor la respuesta
-
+- Si no se consigue ningún fragmento, significa que la consulta no tiene que ver con el temario, en ese caso contesta: Esa pregunta no aparece en el temario, por lo que no es necesaria mi respuesta
 RESPUESTA:"""
