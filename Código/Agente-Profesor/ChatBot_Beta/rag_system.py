@@ -1,152 +1,149 @@
+import os
+from pathlib import Path
+
+import streamlit as st
 from langchain_community.vectorstores import Chroma
+from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
 from langchain_classic.retrievers import MultiQueryRetriever, EnsembleRetriever
-from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-import os
-import streamlit as st
-from prompts import *
+from prompts import MULTI_QUERY_PROMPT, RAG_TEMPLATE, RAG_TEMPLATE_PRACTICAS
+
+BASE_DIR = Path(__file__).resolve().parent
+EMBEDDING_MODEL = "text-embedding-3-large"
+
+
+def _formatear_documentos(docs):
+    if not docs:
+        return "No se han recuperado documentos."
+    resultado = []
+    for i, doc in enumerate(docs, start=1):
+        meta = doc.metadata
+        nombre = Path(meta.get("source", "Desconocido")).name
+        pagina = meta.get("page", 0) + 1
+        tema = meta.get("tema", "")
+        lab = meta.get("lab", "")
+        resultado.append(f"[Fragmento {i}] - Fuente: {nombre} - Página: {pagina} - Tema: {tema} - Práctica: {lab}\n{doc.page_content.strip()}")
+    return "\n\n".join(resultado)
+
+
+def _mostrar_documentos(docs):
+    return [{
+        "fragmento": i,
+        "contenido": doc.page_content[:1000] + ("..." if len(doc.page_content) > 1000 else ""),
+        "fuente": Path(doc.metadata.get("source", "Desconocido")).name,
+        "pagina": doc.metadata.get("page", 0) + 1,
+    } for i, doc in enumerate(docs[:4], start=1)]
+
+
+def _formatear_historial(historial):
+    if not historial:
+        return "Sin mensajes anteriores."
+    return "\n".join(
+        f"{'Alumno' if m['role'] == 'user' else 'Profesor'}: {m['content']}"
+        for m in historial[-10:]
+        if m.get("role") in {"user", "assistant"}
+    )
+
 
 @st.cache_resource
-def inicializar_sistema_rag():
+def _crear_vectorstore(tipo):
+    carpeta = BASE_DIR / ("Teoria" if tipo == "temario" else "Labs")
+    persistencia = BASE_DIR / ("chroma_temas" if tipo == "temario" else "chroma_practicas")
+    if not carpeta.is_dir():
+        raise FileNotFoundError(f"No existe la carpeta: {carpeta}")
 
-    carpeta_temario = "C:\\Users\\mario\\TFG\\Código\\Agente-Profesor\\ChatBot_Beta\\Teoria"
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    store = Chroma(persist_directory=str(persistencia), embedding_function=embeddings)
 
-    loader = PyPDFDirectoryLoader(carpeta_temario)
+    # No duplicar documentos en cada reinicio. Si cambias PDFs después de indexarlos,
+    # tendrás que reconstruir su índice (instrucciones debajo).
+    if store._collection.count() == 0:
+        docs = PyPDFDirectoryLoader(str(carpeta)).load()
+        if not docs:
+            raise ValueError(f"No hay documentos PDF en {carpeta}")
+        for doc in docs:
+            nombre = Path(doc.metadata.get("source", "")).stem
+            if tipo == "temario":
+                doc.metadata["tema"] = nombre
+            else:
+                doc.metadata["lab"] = nombre
+        fragmentos = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=1000).split_documents(docs)
+        store.add_documents(fragmentos)
+    return store
 
-    temas = loader.load()
 
-    for doc in temas:
-        source = doc.metadata.get("source", "")
+@st.cache_resource
+def _modelos():
+    return ChatOpenAI(model="gpt-4o-mini", temperature=0), ChatOpenAI(model="gpt-4o", temperature=0)
 
-        #Obtengo el nombre del PDF
-        nombre_pdf = os.path.basename(source)
 
-        #Quito la extension .pdf
-        tema = os.path.splitext(nombre_pdf)[0]
-
-        #Guardo el tema como metadata
-        doc.metadata["tema"] = tema
-
-    print(f"Se cargaron {len(temas)} temas.")
-
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=5000,
-        chunk_overlap=1000
+def _crear_retriever(store, practica=None):
+    filtro = {"filter": {"lab": practica}} if practica is not None else {}
+    mmr = store.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 2, "fetch_k": 20, "lambda_mult": 0.8, **filtro},
     )
-
-    docs_split = text_splitter.split_documents(temas)
-
-    #Defino el sistema de embebido y donde se va a almacenar
-    vectorstore = Chroma.from_documents(
-        documents=docs_split,
-        embedding=OpenAIEmbeddings(model="text-embedding-3-large"),
-        persist_directory="C:\\Users\\mario\\TFG\\chroma_db"
+    similitud = store.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": 2, **filtro},
     )
-
-    #Defino los LLMs
-    llm_queries = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-    llm_generation = ChatOpenAI(model="gpt-4o", temperature=0)
-
-    #Defino el primer retriever (recuperador de info): MMR
-    mmr_retriever = vectorstore.as_retriever(
-        search_type="mmr", #Técnica que no solo busca recuperar documentos, busca un equilibrio entre relevancia (que sea útil) y diversidad (que no coja documentos que sean copias entre sí)
-        search_kwargs={
-            "k": 2, #De los 20 recuperados mando 1 al LLM
-            "lambda_mult": 0.8, #Cuanto mas cerca a 1 más peso tendrá la relevancia 
-            "fetch_k": 20 #Primero recupera los 20 fragmentos candidatos
-        }
+    llm_consultas, _ = _modelos()
+    multi = MultiQueryRetriever.from_llm(
+        retriever=mmr,
+        llm=llm_consultas,
+        prompt=PromptTemplate.from_template(MULTI_QUERY_PROMPT),
     )
-
-    similarity_retriever = vectorstore.as_retriever(
-        search_type="similarity", #Otro sistema de retriever que lo que hace es recuperar los fragmentos más similares
-        search_kwargs={
-            "k": 2,#En este caso recupera los 2 más similares
-        } 
-    )
+    return EnsembleRetriever(retrievers=[multi, similitud], weights=[0.7, 0.3])
 
 
-    multi_query_prompt = PromptTemplate.from_template(MULTI_QUERY_PROMPT)
-
-    # MultiQueryRetriever con prompt personalizado
-    mmr_multi_retriever = MultiQueryRetriever.from_llm(
-        retriever=mmr_retriever,
-        llm=llm_queries,
-        prompt=multi_query_prompt
-    )
-
-    # Ensemble Retriever que combina mmr y similarity
-    ensemble_retriever = EnsembleRetriever(
-        retrievers = [mmr_multi_retriever, similarity_retriever],
-        weights=[0.7, 0.3], # Mayor peso a mmr
-        similarity_threshold=0.7
-    )
-
-    prompt = PromptTemplate.from_template(RAG_TEMPLATE) #Transforma el prompt en una plantilla ya que tiene variables que el llm tendrá que procesar
-
-    # Función para formatear y preprocesar los documentos recuperados
-    def format_doc(docs):
-        formatted = []
-
-        '''Con esto lo que hago es que en cada fragmento meto metadatos como el número de fragmento, la fuente y la página. Para a la hora de recuperar datos que involucren distintos fragmentos el LLM sepa que fragmentos pertenecen a la misma página'''
-        for i, doc in enumerate(docs):
-            header = f"[Fragmento {i}]" #Para que el LLM diferencie entre fragmentos
-            if doc.metadata:
-                if 'source' in doc.metadata:
-                    source = doc.metadata['source'].split("\\")[-1] if '\\' in doc.metadata['source'] else doc.metadata['source'] #El nombre del documento
-                    header += f" - Fuente: {source}"
-                if 'page' in doc.metadata:
-                    header += f" - Pagina: {doc.metadata['page']}"
-                if 'tema' in doc.metadata:
-                    header += f" - Tema: {doc.metadata['tema']}"
-
-            content = doc.page_content.strip()
-            formatted.append(f"{header}\n{content}") #De esta forma formateo los fragmentos con una cabecera que incluye metadatos para relacionarlos y el propio contenido del fragmento
-
-        return "\n\n".join(formatted)
-
-    rag_chain = (
-        {
-            "context": ensemble_retriever | format_doc,
-            "question": RunnablePassthrough() #Indico que este argumento ya se lo pasaré
-        }
-        | prompt
-        | llm_generation
-        | StrOutputParser() #Procesa lo que devuelve el LLM
-    )
-
-    return rag_chain, mmr_multi_retriever
-
-def query_rag(question):
+def _consultar(question, tipo, practica=None, historial=None):
     try:
-        rag_chain, retriever = inicializar_sistema_rag()
+        if tipo == "practicas":
+            disponibles = {p.stem for p in (BASE_DIR / "Labs").glob("*.pdf")}
+            if practica not in disponibles:
+                return "La práctica seleccionada no existe en la carpeta Labs.", []
 
-        #Obtener la respuesta
-        response = rag_chain.invoke(question)
-
-        #Obetener los fragmentos para mostrarlos
+        store = _crear_vectorstore("temario" if tipo == "temario" else "practicas")
+        retriever = _crear_retriever(store, practica if tipo == "practicas" else None)
         docs = retriever.invoke(question)
 
-        # Formatear los fragmentos para mostrar
-        docs_info = []
-        for i, doc in enumerate(docs[:2], 1): #Solamente los k primeros que hemos pedido que nos devuelva
-            doc_info = {
-                "fragmento": i,
-                "contenido": doc.page_content[:1000] + "..." if len(doc.page_content) > 1000 else doc.page_content,
-                "fuente": doc.metadata.get('source', 'No especificada').split("\\"[-1]),
-                "pagina": doc.metadata.get('page', 'No especificada')
-            }
+        # Defensa adicional: evitar que un documento de otra práctica llegue al LLM.
+        if tipo == "practicas":
+            docs = [doc for doc in docs if doc.metadata.get("lab") == practica]
 
-            docs_info.append(doc_info)
+        if not docs:
+            return "No he encontrado fragmentos para responder a esta consulta en los documentos correspondientes.", []
 
-        return response, docs_info
+        _, llm_respuestas = _modelos()
+        plantilla = RAG_TEMPLATE if tipo == "temario" else RAG_TEMPLATE_PRACTICAS
+        prompt = PromptTemplate.from_template(plantilla).format(
+            context=_formatear_documentos(docs),
+            history=_formatear_historial(historial),
+            question=question,
+            **({"practica": practica} if tipo == "practicas" else {}),
+        )
+        respuesta = llm_respuestas.invoke(prompt).content
+        return respuesta, _mostrar_documentos(docs)
+
     except Exception as e:
-        error_msg = f"Error al procesar la consulta: {str(e)}"
-        return error_msg, []
+        print("Ocurrio el siguiente error: {e}")
 
 
+def query_rag(question, historial=None):
+    return _consultar(
+        question,
+        "teoria",
+        historial=historial
+    )
 
+
+def query_rag_labs(question, practica, historial=None):
+    return _consultar(
+        question,
+        "practicas",
+        practica=practica,
+        historial=historial
+    )
 
